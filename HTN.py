@@ -485,10 +485,6 @@ class makePipeline:
                 result = sorted(result, key=lambda pipeLine: pipeLine[1])
             except Exception as e:
                 print(e)
-        import os
-        path = 'C:/Users/Jin/Desktop/pyhop-master/MLPlanning/Result/' + str(realTime)
-        if not os.path.isdir(path):
-            os.mkdir(path)
         f = open(self.Data.result_dir + '/result.txt',mode='wt')
         for index, i in enumerate(result):
             f.write(str(index) + "번째 pipeline : ")
@@ -799,6 +795,7 @@ def module(opt):
     #                 'oob_score': 'false', 'random_state': 'null', 'verbose': '0', 'warm_start': 'false'}}]
     # }
     #state.searchSpace = abc
+    print("opt")
     data = dataSet(opt.data_dir, opt.result_dir)
     state = EDA(state, data)
     test = hop(opt.limit_time, data, opt.best_K, opt.alpha, opt.space_type, opt.priority_algo, opt.feature_engineering, opt.input_list, opt.label_index, opt.time_index)
