@@ -1,9 +1,7 @@
+from __future__ import print_function
 from sklearn.model_selection import train_test_split
-import warnings
 import pandas as pd
-import os
 from sklearn.preprocessing import LabelEncoder
-import sys
 import sklearn.preprocessing as PP
 import sklearn.decomposition as DC
 import sklearn.discriminant_analysis as DA
@@ -17,10 +15,237 @@ from sklearn.linear_model import LinearRegression
 from sklearn.linear_model import RidgeClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import zero_one_loss
-from __future__ import print_function
-import copy
-import time
+import copy, time, random, argparse, os, sys, warnings
+from enum import Enum
+from itertools import product
 import random
+#######################################operators
+def chosenTransformer(state, *args): #chosen Transformer은 args를 통해서, list를받아, 그리고 state와
+    #robust, minmax, stadard, normalizer
+    state.PP['Transformer'] = args[1]
+    return state
+
+def chosenFE(state, *args):
+    #PCA, LDA etc..
+    state.PP['FE'] = args[1]
+    return state
+
+def chosenAlgo(state, *args):
+    state.Algo['name'] = args[1]
+    return state
+
+def refineAlgo(state, *args):
+    paramDict = state.algoParam[state.Algo['name']]
+    paramState = {}
+    for index, key in enumerate(paramDict.keys()):
+        paramState[key] = args[1][index]
+    state.Algo['parameter']= paramState
+    return state
+
+def refinePP(state, *args):
+    state.Algo['parameter'].append(args)
+    return state
+
+
+#####################methods
+from enum import Enum
+from itertools import product
+import random
+plan = []
+algoInfo={
+    "binary" : {
+        "suitable" : ["NB", "DT", "KNN", "SVC", "SGD", "RF", "linearREG", "linearSVC", "Ridge"],
+        "unsuitable" : [],
+    },
+    "multiClass" : {
+        "suitable" : ["KNN", "DT", "SVC", "RF", "Ridge"],
+        "unsuitable" : ["linearREG", "SGD", "NB"],
+    },
+    "multiLabel":{
+        "suitable" : ["NB", "DT"],
+        "unsuitable" : ["KNN", "SVC"],
+    },
+    "highFeature":{
+        "suitable" : ["SVC", "DT"],
+        "unsuitable" : [],
+    },
+    "bigDataset":{
+        "suitable" : ["SGD", "DT", "NB"],
+        "unsuitable" : ["KNN", "SVC"],
+    },
+    "smallDataset":{
+        "suitable" : ["NB", "DT", "SVC"],
+        "unsuitable" : [],
+    },
+    "interpretable":{
+        "suitable" : ["NB", "DT", "linearREG"],
+        "unsuitable" : ["KNN"],
+    },
+    "needTransform":{
+        "suitable" : ["linearREG", "SVC", "SGD"],
+        "unsuitable" : [],
+    },
+    "linear":{
+        "suitable" : ["linearREG", "linearSVC", "SGD"],
+        "unsuitable" : [],
+    },
+    "is10K":{
+        "suitable": [],
+        "unsuitable": ["SVC"],
+    }
+}
+
+def randomList(temp):
+    templist  = []
+    ranTemp = random.choice(list(temp))
+    for i in range(len(list(temp))):
+        while ranTemp in templist:
+            ranTemp = random.choice(list(temp))
+        templist.append(ranTemp)
+    return templist
+
+def countSuitable(algo, state):
+    count = 0
+    if 'highFeature' in algo.pros and  state.algo['feature'] is 'high' :
+        count+=1
+    if 'lowFeature' in algo.cons and state.algo['feature'] is 'low' :
+        count+=1
+    if 'interpretable' in algo.pros and state.user['interpretable'] :
+        count+=1
+    if state.PP['dataClean'] is '' and  (algo.missing is 'weak' or algo.noisy is 'weak'):
+        count+=1
+    if algo.needNormalization is 'yes' and state.PP['dataTransform'] is '' :
+        count+=1
+
+    return count
+
+def needAutoCASP(state):
+    if state.user['needAS'] and state.user['needPP'] :
+        return 1
+    if state.user['needAS'] and state.user['needPP'] is False :
+        return 2
+    if state.user['needAS'] is False and state.user['needPP'] :
+        return 3
+### method for "classfiy"
+def decisionTask(state, *args) :
+    if needAutoCASP(state) is 1:
+        return [('choosePP', orderPP)]
+    elif needAutoCASP(state) is 2:
+        return [('selectAlgo', state)]
+    elif needAutoCASP(state) is 3:
+        return [('choosePP', orderPP)]
+    return False
+
+### methods for transform
+
+#데이터 입력 전에 진행할 것
+def needClean(state, *args):
+    if state.data['missing'] >= 1 or state.data['overlap'] >= 1:
+        return True
+    else :
+        return False
+def checkClean(state, args): #data cleaning Task 내부 method
+    subtask =[]
+    if state.data['overlap'] >= 1:
+        subtask.append(('removeoverlap', state))
+    if state.data['missing'] >= 1:
+        subtask.append(('imputation', state))
+    return subtask
+def needTransform(state, *args): #choosePP조건 검사함수
+    #Transform이 필요한가? 혹은 수행했는가 확인
+    return True #임의로 대부분 필요하다고 가정, 혹은 Transform 내부에서 수행 하지 하지 않거나 수행하는 것을 결정
+def needFE(state): #언제 feature engineering이 필요한가, 현재는 사실상 extraction이기 때문에, feature의 수에 따라서 필요성을 정의한다.
+   if state.data['numFeature'] * 10 >= state.data['dataSize'] :
+       return True
+   else :
+       return False
+### method for choosePP
+def orderPP(state, *args):
+    subtask = []
+    if needTransform(state):
+        subtask.append(('transform', checkTransform))
+    return subtask
+
+class Scaler(Enum):
+    minmaxScaler = 0
+    standardScaler = 1
+    normalizer = 2
+    robustScaler =3
+    none = 4
+def checkTransform(state, *args): #data Transforming Task 내부 method
+    orderTransform = []
+    list = randomList(Scaler)
+    # 이외에도 Scaler가 state에 영향을 끼칠 것들 기술, 여기서 setup Algo를 진행해야하는가?(탐색을 위해서는 여기서 setupAlgo를 진행하는 것이 맞다.)
+    if state.data['outlier']: #데이터의 편향에 따라 판단하는 것으로
+        orderTransform.append(("robustScaler"))
+        for i in list:
+            if (i.name) not in orderTransform:
+                orderTransform.append((i.name))
+    else:
+        for i in list:
+            if (i.name) not in orderTransform:
+                orderTransform.append((i.name))
+    #만약 none이라면 none인 데로, oepration이 실행되어야함
+    return [("chosenTransformer", state, orderTransform)]
+
+### methods for FE
+class FE(Enum):
+    PCA = 0
+    ICA = 1
+    none =2
+def checkFE(state, *args): #특징 추출 순서
+    orderFE = []
+    if state.data['numFeature'] * 7 <= state.data['dataSize'] : #고차원 특징이 아닌경우
+        list = randomList(FE)
+        for i in list:
+            if (i.name) not in orderFE:
+                orderFE.append((i.name))
+    else: #고차원의 특징을 가질 경우
+        #orderFE.append(("chosenFE", state, "PCA"))
+        list = randomList(FE)
+        for i in list:
+            orderFE.append((i.name))
+    return [("chosenFE", state, orderFE)]
+
+### methods for selectAlgo
+import itertools
+def decisionAlgorithm(task):
+    algoList=[]
+    temp=[]
+    for key in algoInfo.keys():
+        if key in task:
+            algoList.append(algoInfo[key]['suitable'])
+            temp.append(algoInfo[key]['unsuitable'])
+    algoList = list(set(itertools.chain.from_iterable(algoList)))
+    temp = list(set(itertools.chain.from_iterable(temp)))
+    for t in temp:
+        if t in algoList:
+            algoList.remove(t)
+    return algoList
+
+def checkAlgo(state, *args):
+    orderAlgo = []
+    list = [state.EDA['task'], state.EDA['dimension'], state.EDA['interpretable'], state.EDA['dataSize']]
+    orderAlgo = decisionAlgorithm(list)
+    return [("chosenAlgo", state, orderAlgo)]
+
+###methods for setupPP
+def generateParam(state, *args):  #state에 있는 알고리즘에 따라서 파라미터 및 range 생성
+    paramDict = state.algoParam[state.Algo['name']]
+    temp = []
+    for key in paramDict.keys():
+        temp.append(paramDict[key])
+    paramList = list(product(*temp))
+    return [('refineAlgo', state,  paramList, list(paramDict.keys()))]
+
+    # sklearn default c value : 1.0, gamma : scale(auto)
+
+
+
+
+
+
+
 class MultiColumnLabelEncoder:
     def __init__(self, columns=None):
         self.columns = columns  # array of column names to encode
@@ -47,7 +272,6 @@ class MultiColumnLabelEncoder:
         return self.fit(X, y).transform(X)
 
 class dataSet:
-    dataNum = -1
     df = pd.DataFrame()
     X = pd.DataFrame()
     y = pd.DataFrame()
@@ -60,18 +284,18 @@ class dataSet:
     label = ""
     headers = []
 
-    def __init__(self, i, input_list, label_index, time_index):
-        if i is not -1:  # 이미 한번 로드 되었으면 더이상 로드하지않음
-            data_dir = self.path_dir + '/archive (' + str(i) + ')'
-            data_list = os.listdir(data_dir)
-            for data in data_list:
-                dir = data_dir + '/' + data
-                self.df = pd.read_csv(dir, encoding='UTF8', error_bad_lines=False)  # 데이터 로드
-                self.headers = list(self.df)  # The header row is now consumed
-                self.ncol = len(self.df)
-                self.label = list(self.df)[-1]
-                self.dataNum = i
-            self.encoder()  # df에 대해서 인코딩
+    def __init__(self, data_dir, result_dir, input_list="[:-2]", label_index=-1, time_index=-1000):
+        path_dir = data_dir
+        data_list = os.listdir(path_dir)
+        self.result_dir = result_dir
+        for data in data_list:
+            dir = data_dir + '/' + data
+            self.df = pd.read_csv(dir, encoding='UTF8', error_bad_lines=False)  # 데이터 로드
+            self.headers = list(self.df)  # The header row is now consumed
+            self.ncol = len(self.df)
+            self.label = list(self.df)[label_index]
+        self.encoder()  # df에 대해서 인코딩
+
 
     def searchPhase(self):
         serachData = self.df.sample(n=int(len(self.df) * 0.6))  # 먼저 전체 데이터 셋에서 샘플링
@@ -109,146 +333,14 @@ class dataSet:
             self.df = MultiColumnLabelEncoder(label).fit_transform(self.df)  # X 데이터 라벨 인코더
         self.headers = list(self.df)
 
-class datasetLoader:
-    def __init__(self):
-        warnings.filterwarnings(action='ignore')
-        self.path_dir = 'C:/Users/Jin/Desktop/pyhop-master/MLPlanning/dataset'
-        self.self.folder_list = os.listdir(self.path_dir)
-        self.metaData= []
-        self.dataset= dataSet(-1)
-    def load_data(self, i):
-        data_dir = self.path_dir + '/archive (' + str(i) + ')'
-        data_list = os.listdir(data_dir)
-        for data in data_list:
-            md = {}
-            dir = data_dir + '/' + data
-            df = pd.read_csv(dir, encoding='UTF8', error_bad_lines=False)
-            headers = list(df)  # The header row is now consumed
-            ncol = len(df)
-            nrow = len(df.columns)
-            md['name'] = data
-            md['nrows'] = nrow
-            md['ncol'] = ncol
-            md['labelIndex'] = -1
-            md['directory'] = dir
-            self.metaData.append(md)
-            if len(headers) >= 3:
-                X = df.loc[:, headers[:-1]]
-            else:
-                X = df.loc[:, headers[0]]
-            y = df.loc[:, headers[-1]]
-            # print(df.describe())
-            # 5000만 되도 linear SVC는 시간이 꽤걸린다.
-            #print(df.describe())
-            header = list(X)
-            count = 0
-            oneHot = []
-            label = []
-            headers = list(X)
-            for col in headers:
-                if df[col].dtype == 'object':
-                    count += 1
-                    if len(df[col].unique()) <= 4:
-                        oneHot.append(col)
-                    else:
-                        label.append(col)
-            dummy = pd.get_dummies(X, columns=oneHot, drop_first=True) #X 데이터 onehot encoder
-            X = dummy.where(pd.notnull(dummy), dummy.mean(), axis='columns')  # 결측치처리
-            if len(label) >= 1:
-                X = MultiColumnLabelEncoder(label).fit_transform(X) # X 데이터 라벨 인코더
-            return train_test_split(X, y, test_size=0.3, random_state=105)
-    def load_data_percent(self, i, percent):
-        data_dir = self.path_dir + '/archive (' + str(i) + ')'
-        data_list = os.listdir(data_dir)
-        for data in data_list:
-            md = {}
-            dir = data_dir + '/' + data
-            df = pd.read_csv(dir, encoding='UTF8', error_bad_lines=False)
-            headers = list(df)  # The header row is now consumed
-            ncol = len(df)
-            nrow = len(df.columns)
-            md['name'] = data
-            md['nrows'] = nrow
-            md['ncol'] = ncol
-            md['labelIndex'] = -1
-            md['directory'] = dir
-            self.metaData.append(md)
-            if len(headers) >= 3:
-                X = df.loc[:, headers[:-1]].sample(n=int(ncol*(percent/100)))
-            else:
-                X = df.loc[:, headers[0]].sample(n=int(ncol*(percent/100)))
-            y = df.loc[:, headers[-1]].sample(n=int(ncol*(percent/100)))
-            # print(df.describe())
-            # 5000만 되도 linear SVC는 시간이 꽤걸린다.
-            #print(df.describe())
-            header = list(X)
-            count = 0
-            le = LabelEncoder()
-            oneHot = []
-            label = []
-            headers = list(X)
-            for col in headers:
-                if df[col].dtype == 'object':
-                    count += 1
-                    if len(df[col].unique()) <= 4:
-                        oneHot.append(col)
-                    else:
-                        label.append(col)
-            dummy = pd.get_dummies(X, columns=oneHot, drop_first=True) #X 데이터 onehot encoder
-            X = dummy.where(pd.notnull(dummy), dummy.mean(), axis='columns')  # 결측치처리
-            if len(label) >= 1:
-                X = MultiColumnLabelEncoder(label).fit_transform(X) # X 데이터 라벨 인코더
-            return train_test_split(X, y, test_size=0.3, random_state=2)
-    def nonSplitData(self, i, percent):
-        data_dir = self.path_dir + '/archive (' + str(i) + ')'
-        data_list = os.listdir(data_dir)
-        for data in data_list:
-            md = {}
-            dir = data_dir + '/' + data
-            df = pd.read_csv(dir, encoding='UTF8', error_bad_lines=False)
-            headers = list(df)  # The header row is now consumed
-            ncol = len(df)
-            nrow = len(df.columns)
-            md['name'] = data
-            md['nrows'] = nrow
-            md['ncol'] = ncol
-            md['labelIndex'] = -1
-            md['directory'] = dir
-            self.metaData.append(md)
-            if len(headers) >= 3:
-                X = df.loc[:, headers[:-1]].sample(n=int(ncol*(percent/100)))
-            else:
-                X = df.loc[:, headers[0]].sample(n=int(ncol*(percent/100)))
-            y = df.loc[:, headers[-1]].sample(n=int(ncol*(percent/100)))
-            # print(df.describe())
-            # 5000만 되도 linear SVC는 시간이 꽤걸린다.
-            #print(df.describe())
-            header = list(X)
-            count = 0
-            le = LabelEncoder()
-            oneHot = []
-            label = []
-            headers = list(X)
-            for col in headers:
-                if df[col].dtype == 'object':
-                    count += 1
-                    if len(df[col].unique()) <= 4:
-                        oneHot.append(col)
-                    else:
-                        label.append(col)
-            dummy = pd.get_dummies(X, columns=oneHot, drop_first=True) #X 데이터 onehot encoder
-            X = dummy.where(pd.notnull(dummy), dummy.mean(), axis='columns')  # 결측치처리
-            if len(label) >= 1:
-                X = MultiColumnLabelEncoder(label).fit_transform(X) # X 데이터 라벨 인코더
-            return X, y
 
 class makePipeline:
-    def __init__(self, dataNum, input_list, label_index, time_index, best_K, alpha, space_type):
-        Data = dataSet(dataNum, input_list, label_index, time_index)
+    def __init__(self, data, input_list, label_index, time_index, best_K, alpha, space_type):
+        self.Data = data
         self.best_K =  best_K
         self.alpha = alpha
         self.space_type = space_type
-        algoParam = {
+        self.algoParam = {
             "SGD": {
                 'max_iter': [1000, 10000],
                 'alpha': [0.0001, 0.002],
@@ -285,7 +377,7 @@ class makePipeline:
                 'min_samples_leaf': [1, 2, 3],
             }
         }
-    def trans(name):
+    def trans(self, name):
         dict = {
             'minmaxScaler': PP.MinMaxScaler(),
             'standardScaler': PP.StandardScaler(),
@@ -294,7 +386,7 @@ class makePipeline:
             'none': False,
         }
         return dict.get(name)
-    def FE(name):
+    def FE(self, name):
         dict = {
             'PCA': DC.PCA(),
             'LDA': DA.LinearDiscriminantAnalysis(),
@@ -303,9 +395,7 @@ class makePipeline:
             'none': False,
         }
         return dict.get(name)
-
-    from sklearn.metrics import zero_one_loss
-    def Algo(name, parameter):
+    def Algo(self, name, parameter):
         dict = {
             "NB": GaussianNB,
             "DT": DecisionTreeClassifier,
@@ -322,8 +412,7 @@ class makePipeline:
     # from MLPlanning.auto.autosklearn.metalearning.metafeatures import metafeature
     import time
     # phase 1 training & scoring & timer
-    def planToPipeline(self, plan, dataset):
-        Data = dataSet(dataset)
+    def planToPipeline(self, plan):
         scaler = self.trans(plan[0][2])
         feat = self.FE(plan[1][2])
         algoName = plan[2][2]
@@ -344,7 +433,7 @@ class makePipeline:
             start = time.time()
             score = 0
             for i in range(0, 5):
-                X_train, X_test, y_train, y_test = Data.searchPhase()
+                X_train, X_test, y_train, y_test = self.Data.searchPhase()
                 clf.fit(X_train, y_train)
                 a = clf.predict(X_test)
                 s = zero_one_loss(a, y_test)
@@ -361,7 +450,8 @@ class makePipeline:
 
     # Sbest,랑 Srandom 정하기
     import random
-    def selectPhase(pipeLineList, self, dataset, realTime):
+    def selectPhase(self, pipeLineList, realTime):
+        k= self.best_K
         if len(pipeLineList) <= self.best_K:
             k = len(pipeLineList)
         bestPeorformance = pipeLineList[0][1]
@@ -396,12 +486,10 @@ class makePipeline:
             except Exception as e:
                 print(e)
         import os
-        dataName = \
-        os.listdir('C:/Users/Jin/Desktop/pyhop-master/MLPlanning/dataSet/' + 'archive (' + str(dataset) + ')')[0]
         path = 'C:/Users/Jin/Desktop/pyhop-master/MLPlanning/Result/' + str(realTime)
         if not os.path.isdir(path):
             os.mkdir(path)
-        f = open('C:/Users/Jin/Desktop/pyhop-master/MLPlanning/Result/' + str(realTime) + '/' + dataName.replace(".csv","") + '.txt',mode='wt')
+        f = open(self.Data.result_dir + '/result.txt',mode='wt')
         for index, i in enumerate(result):
             f.write(str(index) + "번째 pipeline : ")
             for j in i[0].steps:
@@ -411,10 +499,10 @@ class makePipeline:
         return -1000
 
 class hop:
-    def __init__(self, time, dataSet, best_K, alpha, space_type, priority_algo, feature_engineering, input_list, label_index, time_index, **search_space):
+    def __init__(self, limit_time, dataSet, best_K, alpha, space_type, priority_algo, feature_engineering, input_list, label_index, time_index, **search_space):
         self.startTime = time.time()
-        self.setTime = time
-        self.realTime = time
+        self.setTime = limit_time
+        self.realTime = limit_time
         self.operators = {}
         self.methods = {}
         self.pipeLineList = []
@@ -471,19 +559,17 @@ class hop:
         if verbose>0: print(
             '** hop, verbose={}: **\n   state = {}\n   tasks = {}'.format(
                 verbose, state.__name__, tasks))
-        result = self.seek_plan(state,tasks,operators,methods,[],0,verbose)
+        result = self.seek_plan(state, tasks,operators,methods,[],0)
         print("A")
-        self.pipelineCreator.selectPhase(sorted(self.pipeLineList, key=lambda pipeLine: pipeLine[1]), self.dataset, self.self.realTime)
-        import os
-        dataName = os.listdir('C:/Users/Jin/Desktop/pyhop-master/MLPlanning/dataSet/' + 'archive (' + str(self.dataset) + ')')[0]
-        f = open('C:/Users/Jin/Desktop/pyhop-master/MLPlanning/Result/' + str(self.realTime) + '/' +  dataName.replace(".csv", "") + '.txt', mode='a')
-        f.write("소모 시간 : " + str(time.time() - startTime))
+        self.pipelineCreator.selectPhase(sorted(self.pipeLineList, key=lambda pipeLine: pipeLine[1]), self.realTime)
+        f = open(self.dataSet.result_dir + '/result.txt', mode='a')
+        f.write("소모 시간 : " + str(time.time() - self.startTime))
         f.close()
         if verbose>0: print('** result =',result,'\n')
         return result
 
 
-    def search_operators(state, self, tasks,operators,methods,plan,task,depth,verbose):
+    def search_operators(self, state, tasks,operators,methods,plan,task,depth,verbose):
         if verbose>2:
             print('depth {} action {}'.format(depth,task))
         operator = operators[task[0]] #task의 첫번째 인자를 operator로 하며
@@ -501,7 +587,7 @@ class hop:
                 print('make pipeline : ', end=' ')
             return self.seek_plan(newstate,tasks[1:],operators,methods,plan+[task],depth+1,verbose)
 
-    def search_methods(state, self, tasks,operators,methods,plan,task,depth,verbose):
+    def search_methods(self, state, tasks,operators,methods,plan,task,depth,verbose):
         if verbose>2:
             print('depth {} method instance {}'.format(depth,task))
         relevant = methods[task[0]]
@@ -518,7 +604,7 @@ class hop:
                     return solution
 
 
-    def seek_plan(state, self, tasks,operators,methods,plan,depth,verbose=0):
+    def seek_plan(self, state, tasks,operators,methods,plan,depth,verbose=0):
         """
         Workhorse for pyhop. state, tasks, operators, and methods are as in the
         plam function.
@@ -530,10 +616,10 @@ class hop:
         if verbose>1:
             print('depth {} tasks {}'.format(depth,tasks))
         if tasks == []:
-            planResult = self.pipelineCreator.planToPipeline(plan, self.dataset)
+            planResult = self.pipelineCreator.planToPipeline(plan)
             print(planResult)
             self.pipeLineList.append(planResult)
-            setTime = setTime - planResult[2] - planResult[3]
+            self.setTime = self.setTime - planResult[2] - planResult[3]
             if verbose>2:
                 print('depth {} returns plan {}'.format(depth,plan))
             return plan
@@ -543,40 +629,37 @@ class hop:
             result= []
             #operator일 경우
             for oper in task[2]:
-                if setTime >= 0 :
+                if self.setTime >= 0 :
                     temp =(task[0], task[1], oper) #operation, state, parameter,
                     self.search_operators(state, tasks, operators,methods,plan,temp,depth,verbose)
                 else : #phase 2 로 넘어가야함
-                    if setTime != -1000 or setTime>=0:
-                        setTime = self.pipelineCreator.selectPhase(sorted(self.pipeLineList, key=lambda pipeLine: pipeLine[1]), self.dataset, self.realTime)
-                        import os
-
-                        dataName = os.listdir('C:/Users/Jin/Desktop/pyhop-master/MLPlanning/self.dataset/' + 'archive (' + str(self.dataset) + ')')[0]
-                        f = open('C:/Users/Jin/Desktop/pyhop-master/MLPlanning/Result/' + str(self.realTime) + '/' +  dataName.replace(".csv", "") + '.txt', mode='a')
-                        global startTime
-                        f.write("소모 시간 : " + str(time.time() - startTime))
+                    if self.setTime != -1000 or self.setTime>=0:
+                        self.setTime = self.pipelineCreator.selectPhase(sorted(self.pipeLineList, key=lambda pipeLine: pipeLine[1]), self.realTime)
+                        f = open(self.dataSet.result_dir +'/result.txt', mode='a')
+                        f.write("소모 시간 : " + str(time.time() - self.startTime))
                         f.close()
                     else :
                         return False
         if task[0] in methods:
-            return self.search_methods(state,tasks,operators,methods,plan,task,depth,verbose)
+            return self.search_methods(state, tasks,operators,methods,plan,task,depth,verbose)
         if verbose>2:
             print('depth {} returns failure'.format(depth))
         return False
 
-def EDA(state, datasetNum, *args):
+def EDA(state, data, *args):
     state.data['missing'] = 0
-    df, y = datasetLoader.nonSplitData(datasetNum, 100)
+    df = data.df
+    y= data.y
     state.data['missing'] = df.isnull().sum().sum()
     features = list(df.columns.values)
-    state.data['numfeature'] = 10
     state.data['numfeature'] = len(features)
     state.data['dataSize'] = len(df)
+    SMALLDATASIZE= 10000
     #데이터셋 크기
-    if state.data['dataSize'] < 10000 :
-        state.eda['datasize'] = 'smalldataset'
+    if state.data['dataSize'] < SMALLDATASIZE :
+        state.EDA['datasize'] = 'smalldataset'
 
-    elif state.data['dataSize'] >=80000 and state.data['dataSize'] <100000 :
+    elif state.data['dataSize'] >=8*SMALLDATASIZE and state.data['dataSize'] <10*SMALLDATASIZE :
         state.Algo['dataSize'] = 'mid'
         state.EDA['SVC'] = 'cantSVC'
     else :
@@ -593,7 +676,7 @@ def EDA(state, datasetNum, *args):
         state.Algo['feature'] = 'mid'
     return state
 
-def module(limitTime, data, best_K, alpha, space_type, priority_algo, feature_engineering, input_list, label_index, time_index):
+def module(opt):
     state = hop.State('State')
     state.Algo = {
         'name': '',
@@ -716,16 +799,25 @@ def module(limitTime, data, best_K, alpha, space_type, priority_algo, feature_en
     #                 'oob_score': 'false', 'random_state': 'null', 'verbose': '0', 'warm_start': 'false'}}]
     # }
     #state.searchSpace = abc
+    data = dataSet(opt.data_dir, opt.result_dir)
     state = EDA(state, data)
-    test = hop(limitTime, data, best_K, alpha, space_type, priority_algo, feature_engineering, input_list, label_index, time_index)
-    test.plan(state, [('classify', state)], test.get_operators(), test.get_methods(), data, verbose=0)
+    test = hop(opt.limit_time, data, opt.best_K, opt.alpha, opt.space_type, opt.priority_algo, opt.feature_engineering, opt.input_list, opt.label_index, opt.time_index)
+    test.declare_operators(chosenFE, chosenTransformer, chosenAlgo, refineAlgo, refinePP)
+    test.declare_methods('classify', decisionTask)
+    test.declare_methods('choosePP', orderPP)
+    test.declare_methods('transform', checkTransform)
+    test.declare_methods('FE', checkFE)
+    test.declare_methods('selectAlgo', checkAlgo)
+    test.declare_methods('setupAlgo', generateParam)
+    test.plan(state, [('classify', state)], test.get_operators(), test.get_methods())
 
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--limit_time', default=3600, type=int)
-    parser.add_argument('--data')
+    parser.add_argument('--data_dir', required=True)
+    parser.add_argument('--result_dir', required=True)
     parser.add_argument('--best_K', default=5, type=int)
     parser.add_argument('--alpha', default=0.03, type=float)
     parser.add_argument('--space_type', default="medium")
@@ -735,3 +827,4 @@ if __name__ == '__main__':
     parser.add_argument('--label_index', default= -1, type=int)
     parser.add_argument('--time_index', default=-10, type=int)
     module(parser.parse_args())
+
